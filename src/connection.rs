@@ -1085,6 +1085,11 @@ impl Connection {
             self.config.password().as_bytes(),
             &service_name,
         );
+        // Keeper fork: external-auth mode emits an AUTH_PROXY_INJECT marker in
+        // phase-2 so keeperdb_proxy injects the real credentials server-side.
+        if self.config.proxy_inject {
+            auth.set_proxy_inject(true);
+        }
 
         // Phase one: send username and session info
         {
