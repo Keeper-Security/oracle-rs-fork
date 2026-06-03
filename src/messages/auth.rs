@@ -111,6 +111,14 @@ pub struct AuthMessage {
     _service_name: String,
     /// Sequence number for protocol messages
     sequence_number: u8,
+    /// External-auth ("proxy inject") mode. When true, phase-2 emits a single
+    /// `AUTH_PROXY_INJECT="1"` marker instead of computing
+    /// `AUTH_SESSKEY`/`AUTH_PBKDF2_SPEEDY_KEY`/`AUTH_PASSWORD`, and the client
+    /// skips verifier generation + `AUTH_SVR_RESPONSE` verification. A
+    /// credential-injecting proxy (keeperdb_proxy) supplies the real fields
+    /// server-side. Mirrors patched python-oracledb's `FORCE_EXTERNAL_AUTH`.
+    /// (Keeper fork addition — see crate NOTICE.)
+    proxy_inject: bool,
 }
 
 /// Authentication phase
@@ -154,12 +162,19 @@ impl AuthMessage {
             driver_name: format!("oracle-rs : {}", env!("CARGO_PKG_VERSION")),
             _service_name: service_name.to_string(),
             sequence_number: 1,
+            proxy_inject: false,
         }
     }
 
     /// Set the sequence number for protocol messages
     pub fn set_sequence_number(&mut self, seq: u8) {
         self.sequence_number = seq;
+    }
+
+    /// Enable external-auth ("proxy inject") mode — see the `proxy_inject`
+    /// field. (Keeper fork addition.)
+    pub fn set_proxy_inject(&mut self, enabled: bool) {
+        self.proxy_inject = enabled;
     }
 
     /// Set SYSDBA mode
@@ -274,11 +289,8 @@ impl AuthMessage {
 
     /// Build phase two request (encrypted password and session parameters)
     fn build_phase_two(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
-        // This requires session data from phase one response
-        let encoded_password = self.encode_password()?;
-        let session_key = self.client_session_key.as_ref()
-            .ok_or_else(|| Error::Protocol("Client session key not generated".to_string()))?;
-
+        // Crypto (AUTH_SESSKEY/AUTH_PASSWORD) is computed lazily in the
+        // password branch below; proxy-inject mode skips it entirely.
         let mut buf = WriteBuffer::with_capacity(1024);
 
         // Reserve space for packet header
@@ -321,7 +333,12 @@ impl AuthMessage {
         // Base pairs: AUTH_SESSKEY, AUTH_PASSWORD, SESSION_CLIENT_CHARSET,
         //             SESSION_CLIENT_DRIVER_NAME, SESSION_CLIENT_VERSION, AUTH_ALTER_SESSION = 6
         // For 12c verifier: add AUTH_PBKDF2_SPEEDY_KEY = 7
-        let num_pairs = if self.verifier_type == verifier_type::V12C {
+        // proxy-inject: AUTH_PROXY_INJECT marker + 4 session pairs = 5.
+        // normal: AUTH_SESSKEY + AUTH_PASSWORD + 4 session pairs (+ speedy key
+        // for 12c) = 6 (11g) / 7 (12c).
+        let num_pairs = if self.proxy_inject {
+            5u32
+        } else if self.verifier_type == verifier_type::V12C {
             7u32 // 6 base + AUTH_PBKDF2_SPEEDY_KEY
         } else {
             6u32 // base pairs only
@@ -339,22 +356,36 @@ impl AuthMessage {
             buf.write_bytes_with_length(Some(user_bytes))?;
         }
 
-        // Session key (client portion)
-        let session_key_hex = hex::encode_upper(session_key);
-        // For 12c, use first 64 chars; for 11g, use first 96 chars
-        let key_len = if self.verifier_type == verifier_type::V12C { 64 } else { 96 };
-        let key_str = &session_key_hex[..key_len.min(session_key_hex.len())];
-        self.write_key_value(&mut buf, "AUTH_SESSKEY", key_str, 1)?;
+        if self.proxy_inject {
+            // External auth: a single AUTH_PROXY_INJECT="1" marker in place of
+            // AUTH_SESSKEY / AUTH_PBKDF2_SPEEDY_KEY / AUTH_PASSWORD. keeperdb_proxy
+            // detects this field and replaces it with the real credential fields
+            // (built from credentials it owns server-side), adjusting num_pairs to
+            // match. Mirrors patched python-oracledb's FORCE_EXTERNAL_AUTH layout
+            // so the proxy parses both client implementations identically.
+            self.write_key_value(&mut buf, "AUTH_PROXY_INJECT", "1", 0)?;
+        } else {
+            // Session key (client portion)
+            let session_key = self.client_session_key.as_ref().ok_or_else(|| {
+                Error::Protocol("Client session key not generated".to_string())
+            })?;
+            let session_key_hex = hex::encode_upper(session_key);
+            // For 12c, use first 64 chars; for 11g, use first 96 chars
+            let key_len = if self.verifier_type == verifier_type::V12C { 64 } else { 96 };
+            let key_str = &session_key_hex[..key_len.min(session_key_hex.len())];
+            self.write_key_value(&mut buf, "AUTH_SESSKEY", key_str, 1)?;
 
-        // For 12c, include speedy key
-        if self.verifier_type == verifier_type::V12C {
-            if let Some(speedy) = self.generate_speedy_key()? {
-                self.write_key_value(&mut buf, "AUTH_PBKDF2_SPEEDY_KEY", &speedy, 0)?;
+            // For 12c, include speedy key
+            if self.verifier_type == verifier_type::V12C {
+                if let Some(speedy) = self.generate_speedy_key()? {
+                    self.write_key_value(&mut buf, "AUTH_PBKDF2_SPEEDY_KEY", &speedy, 0)?;
+                }
             }
-        }
 
-        // Encrypted password
-        self.write_key_value(&mut buf, "AUTH_PASSWORD", &encoded_password, 0)?;
+            // Encrypted password
+            let encoded_password = self.encode_password()?;
+            self.write_key_value(&mut buf, "AUTH_PASSWORD", &encoded_password, 0)?;
+        }
 
         // Session parameters
         self.write_key_value(&mut buf, "SESSION_CLIENT_CHARSET", "873", 0)?;
@@ -451,11 +482,19 @@ impl AuthMessage {
         match self.phase {
             AuthPhase::One => {
                 self.phase = AuthPhase::Two;
-                self.generate_verifier()?;
+                // In proxy-inject mode the proxy owns key derivation; the
+                // client has no real password and never computes a verifier.
+                if !self.proxy_inject {
+                    self.generate_verifier()?;
+                }
             }
             AuthPhase::Two => {
                 self.phase = AuthPhase::Complete;
-                self.verify_server_response()?;
+                // No combo_key exists in proxy-inject mode, so there is nothing
+                // to verify AUTH_SVR_RESPONSE against — the proxy authenticated.
+                if !self.proxy_inject {
+                    self.verify_server_response()?;
+                }
             }
             AuthPhase::Complete => {}
         }
@@ -739,6 +778,65 @@ mod tests {
 
         // Verify function code
         assert_eq!(packet[PACKET_HEADER_SIZE + 3], FunctionCode::AuthPhaseOne as u8);
+    }
+
+    // Keeper fork: phase-2 external-auth ("proxy inject") layout. Verifies the
+    // marker is emitted in place of the credential fields and that the packet
+    // mirrors patched python-oracledb's FORCE_EXTERNAL_AUTH shape (so the
+    // keeperdb_proxy parser handles both identically — see M0c cross-repo test).
+    #[test]
+    fn test_phase_two_proxy_inject_layout() {
+        fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+            hay.windows(needle.len()).position(|w| w == needle)
+        }
+
+        let mut msg = AuthMessage::new("PROXY", b"", "XEPDB1");
+        msg.set_proxy_inject(true);
+        // Proxy-inject needs no verifier, so we can jump straight to phase two
+        // without a live server handshake.
+        msg.phase = AuthPhase::Two;
+        // Model an Oracle 21c-negotiated connection: TTC field version < 18, so
+        // no ub8 token precedes the auth header (matches the keeperdb_proxy
+        // parser and python-oracledb against the same server).
+        let mut caps = Capabilities::new();
+        caps.ttc_field_version = crate::constants::ccap_value::FIELD_VERSION_12_2;
+
+        let packet = msg.build_request(&caps, false).unwrap();
+
+        // Phase-two function code (0x73), same byte python-oracledb sends.
+        assert_eq!(
+            packet[PACKET_HEADER_SIZE + 3],
+            FunctionCode::AuthPhaseTwo as u8
+        );
+
+        // The marker replaces the credential fields entirely.
+        assert!(
+            find(&packet, b"AUTH_PROXY_INJECT").is_some(),
+            "marker present"
+        );
+        assert!(
+            find(&packet, b"AUTH_PASSWORD").is_none(),
+            "no password field"
+        );
+        assert!(find(&packet, b"AUTH_SESSKEY").is_none(), "no sesskey field");
+        assert!(
+            find(&packet, b"AUTH_PBKDF2_SPEEDY_KEY").is_none(),
+            "no speedy key"
+        );
+
+        // Session pairs still present (parity with python external-auth).
+        assert!(find(&packet, b"SESSION_CLIENT_CHARSET").is_some());
+        assert!(find(&packet, b"SESSION_CLIENT_DRIVER_NAME").is_some());
+        assert!(find(&packet, b"AUTH_ALTER_SESSION").is_some());
+
+        // Default (pre-negotiation) caps carry no >= 18 TTC field version, so
+        // no ub8 token is written — matching the proxy's expected header.
+        assert!(caps.ttc_field_version < 18, "test assumes no TTC token");
+
+        // Emit the TTC payload (skip 8-byte header + 2-byte data flags) so the
+        // keeper-pam proxy compatibility test can consume a real sample.
+        let ttc = &packet[PACKET_HEADER_SIZE + 2..];
+        println!("FORK_PHASE2_TTC_HEX={}", hex::encode(ttc));
     }
 
     #[test]

@@ -132,6 +132,11 @@ pub struct Config {
     pub ncharset_id: u16,
     /// Statement cache size (0 = disabled)
     pub stmtcachesize: usize,
+    /// External-auth ("proxy inject") mode: in phase-2 the client emits an
+    /// `AUTH_PROXY_INJECT="1"` marker instead of computing real credentials, so
+    /// a credential-injecting proxy (keeperdb_proxy) supplies them server-side.
+    /// (Keeper fork addition — see crate NOTICE.)
+    pub proxy_inject: bool,
 }
 
 impl Config {
@@ -156,6 +161,7 @@ impl Config {
             charset_id: charset::UTF8,
             ncharset_id: charset::UTF16,
             stmtcachesize: DEFAULT_STMTCACHESIZE,
+            proxy_inject: false,
         }
     }
 
@@ -180,6 +186,7 @@ impl Config {
             charset_id: charset::UTF8,
             ncharset_id: charset::UTF16,
             stmtcachesize: DEFAULT_STMTCACHESIZE,
+            proxy_inject: false,
         }
     }
 
@@ -343,10 +350,22 @@ impl Config {
     pub fn build_connect_string(&self) -> String {
         let mut parts = Vec::new();
 
-        // Address
-        let protocol = match self.tls_mode {
-            TlsMode::Disable => "TCP",
-            TlsMode::Require => "TCPS",
+        // Address. The descriptor PROTOCOL describes the hop to the address it
+        // names. In proxy-inject mode that address is the keeperdb_proxy tunnel
+        // and the client's actual TLS to it is driven by `tls_mode` (the
+        // handshake, not this field); the proxy in turn reads this PROTOCOL to
+        // decide how to reach the REAL Oracle behind it — which is plain TCP.
+        // So advertise TCP here even under TLS (mirrors python-oracledb, whose
+        // ssl_context drives client TLS while its descriptor stays TCP).
+        // Emitting TCPS would make the proxy attempt TLS to a plain Oracle
+        // listener and fail. (Keeper fork — see NOTICE.)
+        let protocol = if self.proxy_inject {
+            "TCP"
+        } else {
+            match self.tls_mode {
+                TlsMode::Disable => "TCP",
+                TlsMode::Require => "TCPS",
+            }
         };
         parts.push(format!(
             "(ADDRESS=(PROTOCOL={})(HOST={})(PORT={}))",
@@ -358,7 +377,18 @@ impl Config {
             ServiceMethod::ServiceName(name) => format!("(SERVICE_NAME={})", name),
             ServiceMethod::Sid(sid) => format!("(SID={})", sid),
         };
-        parts.push(format!("(CONNECT_DATA={})", service_part));
+        // Keeper fork: include a CID block with a USER field (matching
+        // python-oracledb's descriptor). The USER value is a placeholder that
+        // keeperdb_proxy rewrites to the real account; its presence lets the
+        // proxy's raw CONNECT username-injection (`modify_connect_packet_user`,
+        // which searches for `(CID=...(USER=...))`) succeed cleanly instead of
+        // falling back to a string path that mangles the packet. Harmless for
+        // direct connections (CID is cosmetic session metadata). See NOTICE.
+        let cid = format!(
+            "(CID=(PROGRAM=keeperdb)(HOST=keeperdb)(USER={}))",
+            self.username
+        );
+        parts.push(format!("(CONNECT_DATA={}{})", service_part, cid));
 
         format!("(DESCRIPTION={})", parts.join(""))
     }
@@ -384,6 +414,7 @@ impl Default for Config {
             charset_id: charset::UTF8,
             ncharset_id: charset::UTF16,
             stmtcachesize: DEFAULT_STMTCACHESIZE,
+            proxy_inject: false,
         }
     }
 }
