@@ -14,8 +14,10 @@ use std::sync::Arc;
 
 use pkcs8::EncryptedPrivateKeyInfo;
 use pkcs8::SecretDocument;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -45,6 +47,15 @@ pub struct TlsConfig {
     pub ssl_server_dn_match: bool,
     /// Expected server certificate DN
     pub ssl_server_cert_dn: Option<String>,
+    /// Keeper fork: this is the leg to a credential-injecting proxy
+    /// (keeperdb_proxy) that presents a self-signed cert over an
+    /// already-authenticated tunnel. ONLY when set do the relaxed proxy-leg
+    /// verifiers apply (accept-any when `!verify_server`, or exact-cert pinning
+    /// with hostname matching skipped when a CA path is set + `!ssl_server_dn_match`).
+    /// Default `false` → standard trust-root-chain + hostname validation, so a
+    /// normal custom-CA connection is never silently downgraded. Set
+    /// automatically from `Config::proxy_inject` in `connect_with_config`.
+    pub proxy_leg: bool,
 }
 
 impl Default for TlsConfig {
@@ -59,6 +70,7 @@ impl Default for TlsConfig {
             wallet_password: None,
             ssl_server_dn_match: false,
             ssl_server_cert_dn: None,
+            proxy_leg: false,
         }
     }
 }
@@ -84,6 +96,14 @@ impl TlsConfig {
     /// Set the CA certificate path
     pub fn with_ca_cert(mut self, path: impl Into<String>) -> Self {
         self.ca_cert_path = Some(path.into());
+        self
+    }
+
+    /// Keeper fork: mark this as the leg to a credential-injecting proxy, which
+    /// enables the relaxed proxy-leg certificate verifiers (see the `proxy_leg`
+    /// field). Off by default; normal connections keep standard validation.
+    pub fn with_proxy_leg(mut self, enabled: bool) -> Self {
+        self.proxy_leg = enabled;
         self
     }
 
@@ -114,6 +134,46 @@ impl TlsConfig {
 
     /// Build the rustls ClientConfig from this configuration
     pub fn build_client_config(&self) -> Result<ClientConfig> {
+        // Keeper fork: proxy-leg verifiers — ONLY on the leg to keeperdb_proxy,
+        // which presents a self-signed cert over a WebRTC-authenticated tunnel,
+        // so the standard trust-root-chain + hostname/SAN check is the wrong
+        // model. These mirror the python sidecar's `_build_proxy_ssl_context`
+        // (CERT_NONE, or pin the exact cert with check_hostname=False). Both
+        // still verify the handshake signature, so the server must hold the key
+        // for the cert it presents. Gated on `proxy_leg` so a normal custom-CA
+        // connection always takes the standard chain-validation path below.
+        if self.proxy_leg {
+            if !self.verify_server {
+                // "Don't verify" / CERT_NONE: accept any cert (encrypt only).
+                return Ok(aws_lc_client_builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert {
+                        algs: proxy_leg_algorithms(),
+                    }))
+                    .with_no_client_auth());
+            }
+            if let Some(ca_path) = &self.ca_cert_path {
+                if !self.ssl_server_dn_match {
+                    // Pin the exact (self-signed) cert, skipping hostname matching —
+                    // the proxy cert's SAN won't match the tunnel host. Drives the
+                    // "self-signed (managed)" and "specify-path" SSL modes.
+                    let pinned = load_certs_from_file(ca_path)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Error::Internal(format!("No certificate found in {}", ca_path))
+                        })?;
+                    return Ok(aws_lc_client_builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(PinnedServerCert {
+                            pinned: pinned.as_ref().to_vec(),
+                            algs: proxy_leg_algorithms(),
+                        }))
+                        .with_no_client_auth());
+                }
+            }
+        }
+
         let mut root_store = RootCertStore::empty();
 
         // Load root certificates
@@ -139,7 +199,7 @@ impl TlsConfig {
         }
 
         // Build client config
-        let builder = ClientConfig::builder().with_root_certificates(root_store);
+        let builder = aws_lc_client_builder().with_root_certificates(root_store);
 
         let config = if let (Some(cert_path), Some(key_path)) =
             (&self.client_cert_path, &self.client_key_path)
@@ -172,6 +232,125 @@ impl TlsConfig {
         };
 
         Ok(config)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keeper fork: proxy-leg certificate verifiers (see build_client_config). The
+// keeperdb_proxy serves a self-signed cert over an already-authenticated tunnel,
+// so these skip the trust-root chain and/or hostname checks the default rustls
+// verifier enforces — while still verifying the handshake signature against the
+// aws-lc-rs provider so the peer must hold the cert's private key.
+// ---------------------------------------------------------------------------
+
+fn proxy_leg_algorithms() -> WebPkiSupportedAlgorithms {
+    rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms
+}
+
+/// Build a rustls `ClientConfig` builder explicitly pinned to the aws-lc-rs
+/// provider.
+///
+/// The fork pins aws-lc-rs (FIPS) for the workspace, but the host binary
+/// (keeperdb-desktop / keeperdb-server) also links rustls' `ring` provider
+/// transitively (reqwest / hyper-rustls via gcp_auth, the AWS SDK, etc.). When
+/// BOTH provider features are enabled on rustls 0.23, the no-argument
+/// `ClientConfig::builder()` panics at runtime because it cannot pick a
+/// process-level default ("Could not automatically determine the process-level
+/// CryptoProvider"). Selecting the provider explicitly removes that ambiguity in
+/// any binary; the isolated crate test only links aws-lc-rs, which is why it
+/// never tripped this.
+fn aws_lc_client_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("aws-lc-rs provider supports the default protocol versions")
+}
+
+/// Accept any server certificate (CERT_NONE / "don't verify"). Encryption only.
+#[derive(Debug)]
+struct AcceptAnyServerCert {
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// Pin an exact (self-signed) server certificate, skipping hostname matching.
+#[derive(Debug)]
+struct PinnedServerCert {
+    pinned: Vec<u8>,
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for PinnedServerCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.pinned.as_slice() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "proxy TLS: server certificate does not match the pinned certificate".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
     }
 }
 
@@ -439,6 +618,60 @@ mod tests {
         assert!(config.verify_server);
         assert!(config.server_name.is_none());
         assert!(config.ca_cert_path.is_none());
+        // Keeper fork: relaxed proxy-leg verifiers are OFF by default, so a
+        // normal connection always gets standard chain + hostname validation.
+        assert!(!config.proxy_leg);
+    }
+
+    // Keeper fork: the proxy-leg verifiers are the most security-sensitive new
+    // code, so exercise them directly (no live handshake needed — only the
+    // cert-equality path is under test, not signature verification).
+    fn a_server_name() -> ServerName<'static> {
+        ServerName::try_from("oracle.example.com").unwrap()
+    }
+
+    #[test]
+    fn test_accept_any_server_cert_accepts_arbitrary() {
+        let verifier = AcceptAnyServerCert {
+            algs: proxy_leg_algorithms(),
+        };
+        let cert = CertificateDer::from(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let result = verifier.verify_server_cert(
+            &cert,
+            &[],
+            &a_server_name(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(result.is_ok(), "accept-any must accept any certificate");
+    }
+
+    #[test]
+    fn test_pinned_server_cert_accepts_exact_match() {
+        let pinned_bytes = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let verifier = PinnedServerCert {
+            pinned: pinned_bytes.clone(),
+            algs: proxy_leg_algorithms(),
+        };
+        let cert = CertificateDer::from(pinned_bytes);
+        let result =
+            verifier.verify_server_cert(&cert, &[], &a_server_name(), &[], UnixTime::now());
+        assert!(result.is_ok(), "exact pinned cert must verify");
+    }
+
+    #[test]
+    fn test_pinned_server_cert_rejects_mismatch() {
+        let verifier = PinnedServerCert {
+            pinned: vec![1u8, 2, 3, 4, 5, 6, 7, 8],
+            algs: proxy_leg_algorithms(),
+        };
+        let different = CertificateDer::from(vec![9u8, 9, 9, 9, 9, 9, 9, 9]);
+        let result =
+            verifier.verify_server_cert(&different, &[], &a_server_name(), &[], UnixTime::now());
+        assert!(
+            result.is_err(),
+            "a certificate other than the pinned one must be rejected"
+        );
     }
 
     #[test]

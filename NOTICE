@@ -1,0 +1,52 @@
+oracle-rs (Keeper Security fork)
+================================
+
+This repository is a fork of `oracle-rs`, a pure-Rust Oracle Database
+thin-mode client.
+
+  Upstream project: https://github.com/stiang/oracle-rs
+  Upstream version: 0.1.6
+  Upstream commit:  4d55e74fb5cc7e5ed5f7d6ccb73869fa13b9dead
+  Upstream author:  Stian Grytøyr
+  Upstream license: MIT OR Apache-2.0 (see LICENSE-MIT, LICENSE-APACHE)
+
+The fork adds a credential-injection ("external auth") mode so the KeeperDB
+Oracle driver can authenticate through Keeper PAM's `keeperdb_proxy` with no
+Oracle Instant Client and no Python (python-oracledb) sidecar. Changes are kept
+surgical and close to the upstream commit above so future upstream merges stay
+clean.
+
+Modifications by Keeper Security relative to upstream 0.1.6:
+
+  1. Pinned the rustls crypto provider to aws-lc-rs (not ring) for the FIPS
+     posture, and selected it explicitly via `ClientConfig::builder_with_provider`
+     (helper `aws_lc_client_builder` in `transport/tls.rs`) so the crate is safe
+     to link in a binary that also pulls rustls' `ring` provider — the
+     no-argument `ClientConfig::builder()` panics at runtime when both providers
+     are present.
+  2. Added proxy-leg TLS certificate verifiers (`AcceptAnyServerCert`,
+     `PinnedServerCert` in `transport/tls.rs`): when connecting through a
+     credential-injecting proxy that presents a self-signed cert over an
+     already-authenticated tunnel, the standard trust-root-chain + hostname
+     check is the wrong model. These mirror python-oracledb's
+     `_build_proxy_ssl_context` (CERT_NONE, or pin the exact cert with hostname
+     matching disabled) while still verifying the handshake signature.
+  3a. CONNECT descriptor (`Config::build_connect_string`) now includes a
+      `(CID=(PROGRAM=...)(HOST=...)(USER=...))` block (matching python-oracledb)
+      so a proxy's raw CONNECT username-injection succeeds. The USER is a
+      placeholder the proxy rewrites; harmless/cosmetic for direct use.
+  3b. In proxy-inject mode, `build_connect_string` advertises `PROTOCOL=TCP`
+      even under TLS (client TLS to the proxy tunnel is driven by `tls_mode`/the
+      handshake, not the descriptor). The proxy reads this PROTOCOL to decide
+      how to reach the real Oracle behind it; `TCPS` would make it attempt TLS
+      to a plain Oracle listener and fail. Mirrors python-oracledb.
+  4. Added an "external auth" mode (`Config::proxy_inject`) in which the
+     phase-2 O5LOGON message emits a single `AUTH_PROXY_INJECT="1"` key-value
+     pair in place of the computed AUTH_SESSKEY/AUTH_PASSWORD credential fields,
+     and the client skips verifier generation + server-response verification, so
+     `keeperdb_proxy` can inject the real credentials server-side. Stock
+     username/password O5LOGON is unchanged and remains the default.
+
+The upstream MIT and Apache-2.0 license texts are retained in LICENSE-MIT and
+LICENSE-APACHE. Per Apache-2.0 §4, this NOTICE records the origin and the
+nature of the changes.
