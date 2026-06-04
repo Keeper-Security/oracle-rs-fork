@@ -786,9 +786,15 @@ impl Connection {
 
         // Wrap with TLS if configured
         let stream = if config.is_tls_enabled() {
-            let tls_config = config.tls_config.as_ref()
+            let mut tls_config = config.tls_config.as_ref()
                 .cloned()
                 .unwrap_or_else(TlsConfig::new);
+            // Keeper fork: the relaxed proxy-leg verifiers (accept-any, or exact
+            // pin with hostname matching off) must apply ONLY when connecting
+            // through a credential-injecting proxy. Derive that from
+            // `proxy_inject` so a normal custom-CA connection keeps standard
+            // chain + hostname validation.
+            tls_config.proxy_leg = config.proxy_inject;
 
             let tls_stream = connect_tls(tcp_stream, &config.host, &tls_config).await?;
             OracleStream::Tls(tls_stream)

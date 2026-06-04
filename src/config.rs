@@ -377,18 +377,27 @@ impl Config {
             ServiceMethod::ServiceName(name) => format!("(SERVICE_NAME={})", name),
             ServiceMethod::Sid(sid) => format!("(SID={})", sid),
         };
-        // Keeper fork: include a CID block with a USER field (matching
-        // python-oracledb's descriptor). The USER value is a placeholder that
-        // keeperdb_proxy rewrites to the real account; its presence lets the
-        // proxy's raw CONNECT username-injection (`modify_connect_packet_user`,
-        // which searches for `(CID=...(USER=...))`) succeed cleanly instead of
-        // falling back to a string path that mangles the packet. Harmless for
-        // direct connections (CID is cosmetic session metadata). See NOTICE.
-        let cid = format!(
-            "(CID=(PROGRAM=keeperdb)(HOST=keeperdb)(USER={}))",
-            self.username
-        );
-        parts.push(format!("(CONNECT_DATA={}{})", service_part, cid));
+        // Keeper fork: in proxy-inject mode, include a CID block with a USER
+        // field (matching python-oracledb's descriptor). The USER value is a
+        // placeholder that keeperdb_proxy rewrites to the real account; its
+        // presence lets the proxy's raw CONNECT username-injection
+        // (`modify_connect_packet_user`, which searches for `(CID=...(USER=...))`)
+        // succeed cleanly instead of falling back to a string path that mangles
+        // the packet. Gated on `proxy_inject` so direct connections emit the
+        // byte-for-byte upstream descriptor. The value is sanitized because
+        // TNS delimits fields with `(` `)` `=` — an unescaped char in a quoted
+        // identifier would terminate the value early and corrupt the descriptor
+        // (and the length the proxy recomputes for the NSD preamble). See NOTICE.
+        let connect_data = if self.proxy_inject {
+            format!(
+                "{}(CID=(PROGRAM=keeperdb)(HOST=keeperdb)(USER={}))",
+                service_part,
+                sanitize_descriptor_value(&self.username)
+            )
+        } else {
+            service_part
+        };
+        parts.push(format!("(CONNECT_DATA={})", connect_data));
 
         format!("(DESCRIPTION={})", parts.join(""))
     }
@@ -397,6 +406,16 @@ impl Config {
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+}
+
+/// Keeper fork: strip the TNS field delimiters `(` `)` `=` from a value
+/// interpolated into a connect descriptor. Used for the CID `USER` placeholder
+/// so a quoted-identifier username can't terminate the value early and corrupt
+/// the descriptor (or the length keeperdb_proxy recomputes for the NSD preamble).
+fn sanitize_descriptor_value(v: &str) -> String {
+    v.chars()
+        .filter(|c| !matches!(c, '(' | ')' | '='))
+        .collect()
 }
 
 impl Default for Config {
@@ -613,6 +632,53 @@ mod tests {
         let config = Config::with_sid("myhost", 1522, "ORCL", "user", "pass");
         let connect_str = config.build_connect_string();
         assert!(connect_str.contains("(SID=ORCL)"));
+    }
+
+    #[test]
+    fn test_direct_connect_string_has_no_cid() {
+        // Keeper fork (M1): without proxy-inject the descriptor is the upstream
+        // shape — no CID block, PROTOCOL follows tls_mode. (Password is a
+        // runtime empty value: build_connect_string never reads it, and a
+        // literal would trip the hard-coded-credential scanner.)
+        let config = Config::new("myhost", 1522, "myservice", "user", String::new());
+        let connect_str = config.build_connect_string();
+        assert!(!connect_str.contains("(CID="), "direct connect must omit CID");
+        assert_eq!(
+            connect_str,
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=myhost)(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=myservice)))"
+        );
+    }
+
+    #[test]
+    fn test_proxy_inject_connect_string_has_cid() {
+        // Keeper fork: proxy-inject adds the CID(USER=) block + PROTOCOL=TCP.
+        let mut config = Config::new("myhost", 1522, "myservice", "scott", String::new());
+        config.proxy_inject = true;
+        let connect_str = config.build_connect_string();
+        assert!(connect_str.contains("(CID=(PROGRAM=keeperdb)(HOST=keeperdb)(USER=scott))"));
+    }
+
+    #[test]
+    fn test_proxy_inject_sanitizes_username_in_cid() {
+        // Keeper fork (H2): TNS delimiters in a quoted-identifier username must
+        // be stripped so they can't terminate the (USER=...) value early.
+        let mut config = Config::new("myhost", 1522, "myservice", "od)d=(user", String::new());
+        config.proxy_inject = true;
+        let connect_str = config.build_connect_string();
+        assert!(connect_str.contains("(USER=odduser)"), "got: {connect_str}");
+        // The descriptor must remain balanced — no stray delimiters leaked in.
+        assert_eq!(
+            connect_str.matches('(').count(),
+            connect_str.matches(')').count(),
+            "parens must stay balanced"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_descriptor_value() {
+        assert_eq!(sanitize_descriptor_value("od)d=(user"), "odduser");
+        assert_eq!(sanitize_descriptor_value("plain_user"), "plain_user");
+        assert_eq!(sanitize_descriptor_value("()()==="), "");
     }
 
     #[test]
