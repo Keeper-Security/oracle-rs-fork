@@ -2420,7 +2420,14 @@ impl Connection {
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
         inner.send(&request).await?;
 
-        // Receive and parse response
+        // Receive and parse response. A query response can span multiple TNS
+        // DATA packets, and a row/value may straddle a packet boundary, so we
+        // accumulate packets into one contiguous payload and parse until the
+        // parser reaches the end-of-response message. We key on that MESSAGE
+        // (not the END_OF_RESPONSE packet flag), because an intermediate prefetch
+        // batch doesn't set the flag — keying on the flag would block waiting for
+        // a packet the server won't send until a fetch_more. A single-packet
+        // response is parsed on the first iteration (common case).
         let response = inner.receive().await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty query response".to_string()));
@@ -2435,9 +2442,32 @@ impl Connection {
             return self.parse_error_response(payload);
         }
 
-        // Parse the response to extract columns and rows
-        let payload = &response[PACKET_HEADER_SIZE..];
-        let mut result = self.parse_query_response(payload, &inner.capabilities)?;
+        // First packet keeps its 2-byte data flags; continuation packets drop
+        // theirs so the message stream stays contiguous for the parser.
+        let caps = inner.capabilities.clone();
+        let mut acc: Vec<u8> = response[PACKET_HEADER_SIZE..].to_vec();
+        let mut result = loop {
+            match self.parse_query_response_eor(&acc, &caps, &[]) {
+                Ok((r, true)) => break r,
+                // Not complete yet (payload exhausted before the terminator) or a
+                // value straddled the packet boundary — pull the next packet.
+                Ok((_, false)) | Err(Error::BufferUnderflow { .. }) => {
+                    let next = inner.receive().await?;
+                    if next.len() < PACKET_HEADER_SIZE + 2 {
+                        return Err(Error::Protocol(
+                            "Truncated continuation packet in query response".to_string(),
+                        ));
+                    }
+                    if next[4] == PacketType::Marker as u8 {
+                        let error_response = inner.handle_marker_reset().await?;
+                        let payload = &error_response[PACKET_HEADER_SIZE..];
+                        return self.parse_error_response(payload);
+                    }
+                    acc.extend_from_slice(&next[PACKET_HEADER_SIZE + 2..]);
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
         // Check if any columns are LOB types that require defines
         let has_lob_columns = result.columns.iter().any(|col| col.is_lob());
@@ -2636,13 +2666,30 @@ impl Connection {
         self.parse_query_response_with_columns(payload, caps, &[])
     }
 
-    /// Parse query response with pre-known columns (for re-execute after define)
+    /// Thin wrapper that drops the end-of-response flag for callers that don't
+    /// stream packets (the response already fits one packet).
     fn parse_query_response_with_columns(
         &self,
         payload: &[u8],
         caps: &Capabilities,
         known_columns: &[ColumnInfo],
     ) -> Result<QueryResult> {
+        Ok(self
+            .parse_query_response_eor(payload, caps, known_columns)?
+            .0)
+    }
+
+    /// Parse a query response, also reporting whether the end-of-response
+    /// terminator message was reached (`true`) or the payload ran out first
+    /// (`false`, meaning more TNS packets are needed — see the streaming loop in
+    /// `execute_query_with_params`). A response can span multiple TNS DATA
+    /// packets; a single packet is NOT guaranteed to contain the whole response.
+    fn parse_query_response_eor(
+        &self,
+        payload: &[u8],
+        caps: &Capabilities,
+        known_columns: &[ColumnInfo],
+    ) -> Result<(QueryResult, bool)> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Query response too short".to_string()));
         }
@@ -2747,13 +2794,16 @@ impl Connection {
             }
         }
 
-        Ok(QueryResult {
-            columns,
-            rows,
-            rows_affected: row_count,
-            has_more_rows: false,
-            cursor_id,
-        })
+        Ok((
+            QueryResult {
+                columns,
+                rows,
+                rows_affected: row_count,
+                has_more_rows: false,
+                cursor_id,
+            },
+            end_of_response,
+        ))
     }
 
     /// Parse a PL/SQL response containing OUT parameter values
