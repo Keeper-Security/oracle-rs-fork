@@ -2032,6 +2032,14 @@ impl Connection {
                     // Status message - usually marks end
                     break;
                 }
+                // Server-side piggyback (23) - skip in full (see parse_dml_response)
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
+                }
+                // Warning (15)
+                x if x == MessageType::Warning as u8 => {
+                    self.skip_warning(&mut buf)?;
+                }
                 x if x == MessageType::EndOfResponse as u8 => {
                     break;
                 }
@@ -2787,6 +2795,16 @@ impl Connection {
                     }
                 }
 
+                // Server-side piggyback (23) - skip in full (see parse_dml_response)
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
+                }
+
+                // Warning (15)
+                x if x == MessageType::Warning as u8 => {
+                    self.skip_warning(&mut buf)?;
+                }
+
                 _ => {
                     // Unknown message type - break to avoid parsing errors
                     break;
@@ -2922,6 +2940,16 @@ impl Connection {
                 x if x == MessageType::ImplicitResultset as u8 => {
                     let parsed_results = self.parse_implicit_results(&mut buf, caps)?;
                     implicit_results = parsed_results;
+                }
+
+                // Server-side piggyback (23) - skip in full (see parse_dml_response)
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
+                }
+
+                // Warning (15)
+                x if x == MessageType::Warning as u8 => {
+                    self.skip_warning(&mut buf)?;
                 }
 
                 _ => {
@@ -3116,6 +3144,121 @@ impl Connection {
         } else {
             Ok(None)
         }
+    }
+
+    /// Consume a SERVER_SIDE_PIGGYBACK (message type 23) body.
+    ///
+    /// Oracle prepends these control messages to a call's response to push
+    /// session-state changes back to the client — e.g. `ALTER SESSION SET
+    /// CURRENT_SCHEMA` makes the server emit a SYNC piggyback carrying the new
+    /// schema. We don't need the contents, but we MUST consume exactly the right
+    /// number of bytes so the message that follows (the call's Error /
+    /// EndOfResponse terminator) is parsed at the correct offset. Skipping this
+    /// is what previously corrupted the stream: `parse_dml_response` fell through
+    /// to its catch-all arm, byte-walked into the piggyback body, and eventually
+    /// misread a data byte as an Error message → "buffer underflow".
+    ///
+    /// The message-type byte (23) has already been read by the caller; this reads
+    /// from the opcode byte onward. Ported 1:1 from python-oracledb
+    /// `_process_server_side_piggyback` (opcode names in comments).
+    fn skip_server_side_piggyback(&self, buf: &mut ReadBuffer) -> Result<()> {
+        let opcode = buf.read_u8()?;
+        match opcode {
+            // LTXID: single length-prefixed byte string
+            7 => {
+                let _ = buf.read_bytes_with_length()?;
+            }
+            // QUERY_CACHE_INVALIDATION (1) | TRACE_EVENT (3): no body
+            1 | 3 => {}
+            // OS_PID_MTS (2)
+            2 => {
+                let _ = buf.read_ub2()?;
+                buf.skip_raw_bytes_chunked()?; // skip_bytes()
+            }
+            // SYNC (5): key/value pairs of session settings (current schema, …)
+            5 => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+                let num_elements = buf.read_ub2()?;
+                buf.skip_ub1()?; // length
+                for _ in 0..num_elements {
+                    if buf.read_ub2()? > 0 {
+                        let _ = buf.read_bytes_with_length()?; // text value
+                    }
+                    if buf.read_ub2()? > 0 {
+                        let _ = buf.read_bytes_with_length()?; // binary value
+                    }
+                    buf.skip_ub2()?; // keyword num
+                }
+                buf.skip_ub4()?; // overall flags
+            }
+            // EXT_SYNC (9)
+            9 => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+            }
+            // AC_REPLAY_CONTEXT (8)
+            8 => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+                buf.skip_ub4()?; // flags
+                buf.skip_ub4()?; // error code
+                buf.skip_ub1()?; // queue
+                // skip_bytes_with_length(): ub4 length, then chunked bytes
+                if buf.read_ub4()? > 0 {
+                    buf.skip_raw_bytes_chunked()?;
+                }
+            }
+            // SESS_RET (4): session return parameters
+            4 => {
+                buf.skip_ub2()?;
+                buf.skip_ub1()?;
+                let num_elements = buf.read_ub2()?;
+                if num_elements > 0 {
+                    buf.skip_ub1()?;
+                    for _ in 0..num_elements {
+                        if buf.read_ub2()? > 0 {
+                            buf.skip_raw_bytes_chunked()?; // key
+                        }
+                        if buf.read_ub2()? > 0 {
+                            buf.skip_raw_bytes_chunked()?; // value
+                        }
+                        buf.skip_ub2()?; // flags
+                    }
+                }
+                buf.skip_ub4()?; // session flags
+                buf.skip_ub4()?; // session id
+                buf.skip_ub2()?; // serial number
+            }
+            // SESS_SIGNATURE (10)
+            10 => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+                buf.skip_ub8()?; // signature flags
+                buf.skip_ub8()?; // client signature
+                buf.skip_ub8()?; // server signature
+            }
+            other => {
+                return Err(Error::Protocol(format!(
+                    "unknown server-side piggyback opcode {other}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a WARNING (message type 15) body. These accompany e.g. DDL that
+    /// "compiled with warnings"; like piggybacks they must be skipped exactly so
+    /// the following terminator parses correctly. Ported from python-oracledb
+    /// `_process_warning_info`.
+    fn skip_warning(&self, buf: &mut ReadBuffer) -> Result<()> {
+        let error_num = buf.read_ub2()?; // error/warning number
+        let msg_present = buf.read_ub2()?; // length of message (indicator)
+        buf.skip_ub2()?; // flags
+        if error_num != 0 && msg_present > 0 {
+            let _ = buf.read_bytes_with_length()?; // message text
+        }
+        Ok(())
     }
 
     /// Parse a single row of data
@@ -3739,6 +3882,18 @@ impl Connection {
                     if buf.remaining() > 0 {
                         let _byte = buf.read_u8()?;
                     }
+                }
+
+                // Server-side piggyback (23) - session-state push (e.g. the SYNC
+                // piggyback from ALTER SESSION SET CURRENT_SCHEMA). Must be
+                // consumed in full so the trailing Error/EndOfResponse parses.
+                23 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
+                }
+
+                // Warning (15)
+                15 => {
+                    self.skip_warning(&mut buf)?;
                 }
 
                 // End of Response (29) - explicit end marker
