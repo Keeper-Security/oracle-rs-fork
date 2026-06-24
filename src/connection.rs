@@ -268,6 +268,46 @@ impl OracleStream {
         }
     }
 
+    /// Half-close the write side (sends TCP FIN) then drain all pending inbound
+    /// data until EOF or a short timeout.
+    ///
+    /// This prevents TCP RST when the socket is subsequently dropped while Oracle
+    /// is still streaming data into the receive buffer.  RST propagates through any
+    /// TCP proxy (e.g. Keeper Commander tunnel) as a fatal signal and tears down the
+    /// whole session; a graceful FIN does not.  Errors are silently ignored — this
+    /// is best-effort cleanup.
+    async fn drain_and_shutdown(&mut self) {
+        // Half-close write side: signals to Oracle that we are done sending.
+        let _ = match self {
+            OracleStream::Plain(s) => AsyncWriteExt::shutdown(s).await,
+            OracleStream::Tls(s) => AsyncWriteExt::shutdown(s).await,
+        };
+        // Drain remaining inbound data so the receive buffer is empty when the
+        // socket drops.  Bounded by a 30 s timeout: a cancelled query can keep
+        // Oracle computing for many seconds before it sends the final result +
+        // FIN; 30 s covers realistic slow queries without blocking forever.
+        let mut buf = [0u8; 4096];
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(30000);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let n = match self {
+                OracleStream::Plain(s) => {
+                    tokio::time::timeout(remaining, AsyncReadExt::read(s, &mut buf)).await
+                }
+                OracleStream::Tls(s) => {
+                    tokio::time::timeout(remaining, AsyncReadExt::read(s, &mut buf)).await
+                }
+            };
+            match n {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(_)) => {}
+            }
+        }
+    }
 }
 
 /// Internal connection state shared across async operations
@@ -5224,9 +5264,12 @@ impl Connection {
 
         inner.state = ConnectionState::Closed;
 
-        // Close the TCP stream
-        if let Some(stream) = inner.stream.take() {
-            drop(stream);
+        // Gracefully close the TCP stream: drain pending receive data before
+        // dropping so the OS sends FIN rather than RST.  RST from a close with
+        // unread receive-buffer data propagates through any TCP proxy (e.g. Keeper
+        // Commander tunnel) as a fatal signal and tears down the whole session.
+        if let Some(mut stream) = inner.stream.take() {
+            stream.drain_and_shutdown().await;
         }
 
         Ok(())
