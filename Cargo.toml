@@ -71,6 +71,9 @@ pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
 # LRU statement cache
 indexmap = "2"
 
+# Zeroize password on drop (Keeper fork — CLAUDE.md requirement)
+secrecy = { version = "0.8", features = ["alloc"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tokio-test = "0.4"
