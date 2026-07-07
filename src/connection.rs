@@ -2682,15 +2682,17 @@ impl Connection {
                                 }
                             }
                             Err(_e) => {
-                                // EOF after reset is normal - server may close connection
-                                // without sending error details. Return a descriptive error.
+                                // EOF after reset: Oracle closed the TCP connection after the
+                                // BREAK/RESET handshake without sending error details. This
+                                // leaves the connection permanently broken — return a connection
+                                // error so callers can detect it via is_connection_error() and
+                                // avoid reusing this connection for subsequent statements.
                                 inner.state = ConnectionState::Closed;
-                                return Err(Error::OracleError {
-                                    code: 0,
-                                    message: "Server rejected the operation and closed the connection. \
-                                              This may happen when binding a temporary LOB to an INSERT statement. \
-                                              Try using a different approach (e.g., DBMS_LOB procedures).".to_string(),
-                                });
+                                return Err(Error::ConnectionClosedByServer(
+                                    "server closed connection after break/reset handshake \
+                                     (DDL errors and some DML errors cause this on Oracle XE)"
+                                        .to_string(),
+                                ));
                             }
                         }
                     }
