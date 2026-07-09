@@ -2517,10 +2517,15 @@ impl Connection {
             }
         };
 
-        // Check if any columns are LOB types that require defines
-        let has_lob_columns = result.columns.iter().any(|col| col.is_lob());
+        // Check if any columns require an explicit define (LOBs, and LONG /
+        // LONG RAW — the latter only stream their chunked data when the DEFINE
+        // advertises MAX_LONG_LENGTH; see execute::write_column_defines. KDB-87).
+        let needs_define = result
+            .columns
+            .iter()
+            .any(|col| col.oracle_type.requires_define());
 
-        if has_lob_columns && !statement.requires_define() {
+        if needs_define && !statement.requires_define() {
             // We need to re-execute with column defines
             // Create a modified statement with the define flag set
             let mut stmt_with_define = statement.clone();

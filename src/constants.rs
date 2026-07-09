@@ -681,6 +681,17 @@ impl OracleType {
         )
     }
 
+    /// Check if this type requires an explicit column DEFINE (via a re-execute)
+    /// to fetch its data correctly.
+    ///
+    /// LOBs need the DEFINE to negotiate locator round-trips. LONG / LONG RAW
+    /// need it because the server only streams their chunked data when the
+    /// DEFINE advertises `MAX_LONG_LENGTH` as the buffer size — without a DEFINE
+    /// the initial (prefetch) execute silently yields zero rows. (KDB-87)
+    pub fn requires_define(&self) -> bool {
+        self.is_lob() || matches!(self, OracleType::Long | OracleType::LongRaw)
+    }
+
     /// Check if this type requires no prefetch (data must be fetched separately)
     pub fn requires_no_prefetch(&self) -> bool {
         matches!(
@@ -981,5 +992,22 @@ mod tests {
         assert_eq!(PacketType::Connect as u8, 1);
         assert_eq!(PacketType::Accept as u8, 2);
         assert_eq!(PacketType::Data as u8, 6);
+    }
+
+    /// KDB-87: LONG / LONG RAW must require a DEFINE (alongside the LOB types)
+    /// so the server streams their chunked data; plain scalar types must not.
+    #[test]
+    fn test_requires_define_covers_long_and_lobs() {
+        // LONG / LONG RAW — the KDB-87 additions.
+        assert!(OracleType::Long.requires_define());
+        assert!(OracleType::LongRaw.requires_define());
+        // LOBs — pre-existing define types.
+        assert!(OracleType::Clob.requires_define());
+        assert!(OracleType::Blob.requires_define());
+        // Scalars must not trigger the re-execute-with-define path.
+        assert!(!OracleType::Varchar.requires_define());
+        assert!(!OracleType::Number.requires_define());
+        assert!(!OracleType::Raw.requires_define());
+        assert!(!OracleType::Date.requires_define());
     }
 }

@@ -486,7 +486,7 @@ impl<'a> ExecuteMessage<'a> {
     /// This tells Oracle how we want the column data returned. For LOB columns,
     /// we need to tell Oracle to return LOB locators instead of inline data.
     fn write_column_defines(&self, buf: &mut WriteBuffer, caps: &Capabilities) -> Result<()> {
-        use crate::constants::{bind_flags, ccap_value, charset, lob_flags};
+        use crate::constants::{bind_flags, ccap_value, charset, lob_flags, MAX_LONG_LENGTH};
 
         for col in self.statement.columns() {
             let mut ora_type_num = col.oracle_type as u8;
@@ -496,6 +496,15 @@ impl<'a> ExecuteMessage<'a> {
             if col.oracle_type == OracleType::Rowid || col.oracle_type == OracleType::Urowid {
                 ora_type_num = OracleType::Varchar as u8;
                 buffer_size = 4000; // MAX_UROWID_LENGTH
+            }
+
+            // LONG / LONG RAW are streamed in length-prefixed chunks (LONG_INDICATOR
+            // 0xFE) rather than sent inline. The DESCRIBE response reports a zero /
+            // undersized buffer_size for these types, and if we forward that to the
+            // DEFINE, Oracle silently skips sending the data (zero rows / empty value).
+            // Advertise the maximum length so the server streams the chunks. (KDB-87)
+            if col.oracle_type == OracleType::Long || col.oracle_type == OracleType::LongRaw {
+                buffer_size = MAX_LONG_LENGTH;
             }
 
             // Set flags - always use indicators
@@ -1128,6 +1137,7 @@ impl<'a> ExecuteMessage<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::statement::ColumnInfo;
 
     #[test]
     fn test_execute_options_for_query() {
@@ -1273,5 +1283,74 @@ mod tests {
         // - write_ub2(300) = [0x02, 0x01, 0x2C] (3 bytes) - same for values up to 65535
         // But for values > 65535, ub4 would use 4 bytes while ub2 would overflow
         assert_eq!(scalar_meta.len(), 2, "Scalar: ub4(0) + ub2(0) = 2 bytes (variable-length encoding)");
+    }
+
+    /// Decode the `buffer_size` field of the first column in a DEFINE message.
+    ///
+    /// DEFINE column layout (see `write_column_defines`):
+    ///   u8 data_type, u8 flag, u8 precision, u8 scale, ub4 buffer_size, ...
+    /// so buffer_size is the ub4 immediately after the first 4 single-byte fields.
+    fn first_define_buffer_size(cols: Vec<ColumnInfo>) -> u32 {
+        use crate::buffer::{ReadBuffer, WriteBuffer};
+
+        let mut stmt = Statement::new("SELECT * FROM t");
+        stmt.set_columns(cols);
+        let opts = ExecuteOptions::for_query(100);
+        let msg = ExecuteMessage::new(&stmt, opts);
+        let caps = Capabilities::new();
+
+        let mut buf = WriteBuffer::new();
+        msg.write_column_defines(&mut buf, &caps).unwrap();
+
+        let mut rd = ReadBuffer::new(buf.freeze());
+        rd.skip(4).unwrap(); // data_type, flag, precision, scale
+        rd.read_ub4().unwrap()
+    }
+
+    /// KDB-87: LONG columns are streamed in chunks; the DEFINE must advertise
+    /// MAX_LONG_LENGTH as the buffer size or Oracle silently skips the data,
+    /// yielding zero rows. The DESCRIBE-reported buffer_size (0 here) must be
+    /// overridden.
+    #[test]
+    fn test_define_long_column_uses_max_long_length() {
+        use crate::constants::MAX_LONG_LENGTH;
+
+        // ColumnInfo::new sets buffer_size = 0, mimicking the DESCRIBE response
+        // for a LONG column.
+        let col = ColumnInfo::new("data", OracleType::Long);
+        assert_eq!(col.buffer_size, 0, "precondition: DESCRIBE reports 0");
+
+        assert_eq!(
+            first_define_buffer_size(vec![col]),
+            MAX_LONG_LENGTH,
+            "DEFINE for LONG must advertise MAX_LONG_LENGTH"
+        );
+    }
+
+    /// KDB-87: LONG RAW gets the same chunked treatment as LONG.
+    #[test]
+    fn test_define_long_raw_column_uses_max_long_length() {
+        use crate::constants::MAX_LONG_LENGTH;
+
+        let col = ColumnInfo::new("data", OracleType::LongRaw);
+        assert_eq!(
+            first_define_buffer_size(vec![col]),
+            MAX_LONG_LENGTH,
+            "DEFINE for LONG RAW must advertise MAX_LONG_LENGTH"
+        );
+    }
+
+    /// Regression guard: non-LONG columns keep their DESCRIBE buffer_size and
+    /// are not affected by the LONG override.
+    #[test]
+    fn test_define_varchar_column_preserves_buffer_size() {
+        let mut col = ColumnInfo::new("name", OracleType::Varchar);
+        col.buffer_size = 2000;
+
+        assert_eq!(
+            first_define_buffer_size(vec![col]),
+            2000,
+            "DEFINE for VARCHAR must preserve the DESCRIBE buffer_size"
+        );
     }
 }
