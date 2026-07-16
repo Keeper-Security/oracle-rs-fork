@@ -2544,10 +2544,12 @@ impl Connection {
             let define_request = define_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
             inner.send(&define_request).await?;
 
-            // Receive and accumulate the re-execute response — LONG data is streamed
-            // inline in chunked format and can span multiple TTC DATA packets
-            // (SDU limit ~8 KB). Apply the same multi-packet loop used for the
-            // first execute so oversized LONG values are fully consumed. KDB-118.
+            // Receive and accumulate the re-execute response. The primary
+            // KDB-118 fix is the trailer consumption in `parse_column_value`
+            // (see `skip_long_column_trailer`); this loop additionally
+            // guards against a LONG value large enough to genuinely span
+            // multiple TTC DATA packets (SDU limit ~8 KB), mirroring the
+            // first-execute accumulation loop above.
             let first_define_pkt = inner.receive().await?;
             if first_define_pkt.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty define response".to_string()));
@@ -3392,6 +3394,21 @@ impl Connection {
         Ok(Row::new(values))
     }
 
+    /// Consume the two UB2 fields Oracle appends after a LONG/LONG RAW
+    /// column's chunked value (observed empirically: both 0 for a value that
+    /// arrived complete in one piece). Without this, the read position drifts
+    /// by these bytes and all subsequent parsing in the response desyncs —
+    /// the row itself decodes correctly, but the following message is
+    /// misread, `parse_query_response_eor` never finds the terminator, and
+    /// the caller either mis-parses a later message as an error or (with a
+    /// multi-packet accumulation loop) blocks forever waiting for a
+    /// continuation packet the server already fully sent. KDB-118.
+    fn skip_long_column_trailer(&self, buf: &mut ReadBuffer) -> Result<()> {
+        buf.read_ub2()?;
+        buf.read_ub2()?;
+        Ok(())
+    }
+
     /// Parse a single column value from the buffer
     fn parse_column_value(&self, buf: &mut ReadBuffer, col: &ColumnInfo, caps: &Capabilities) -> Result<Value> {
         use crate::constants::OracleType;
@@ -3428,11 +3445,18 @@ impl Connection {
                     }
                     OracleType::Varchar | OracleType::Char | OracleType::Long => {
                         let s = String::from_utf8_lossy(&bytes).to_string();
+                        if col.oracle_type == OracleType::Long {
+                            self.skip_long_column_trailer(buf)?;
+                        }
                         Ok(Value::String(s))
                     }
                     OracleType::Raw | OracleType::LongRaw => {
                         // RAW/LONG RAW types - return as bytes
-                        Ok(Value::Bytes(bytes.to_vec()))
+                        let v = bytes.to_vec();
+                        if col.oracle_type == OracleType::LongRaw {
+                            self.skip_long_column_trailer(buf)?;
+                        }
+                        Ok(Value::Bytes(v))
                     }
                     OracleType::Date => {
                         // Oracle DATE format - 7 bytes
