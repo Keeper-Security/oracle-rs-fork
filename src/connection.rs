@@ -2544,27 +2544,41 @@ impl Connection {
             let define_request = define_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
             inner.send(&define_request).await?;
 
-            // Receive the re-execute response
-            let define_response = inner.receive().await?;
-            if define_response.len() <= PACKET_HEADER_SIZE {
+            // Receive and accumulate the re-execute response — LONG data is streamed
+            // inline in chunked format and can span multiple TTC DATA packets
+            // (SDU limit ~8 KB). Apply the same multi-packet loop used for the
+            // first execute so oversized LONG values are fully consumed. KDB-118.
+            let first_define_pkt = inner.receive().await?;
+            if first_define_pkt.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty define response".to_string()));
             }
-
-            // Check for MARKER packet
-            let packet_type = define_response[4];
-            if packet_type == PacketType::Marker as u8 {
+            if first_define_pkt[4] == PacketType::Marker as u8 {
                 let error_response = inner.handle_marker_reset().await?;
                 let payload = &error_response[PACKET_HEADER_SIZE..];
                 return self.parse_error_response(payload);
             }
-
-            // Parse the response with LOB data, using the columns we already know
-            let payload = &define_response[PACKET_HEADER_SIZE..];
-            result = self.parse_query_response_with_columns(
-                payload,
-                &inner.capabilities,
-                &stmt_with_define.columns(),
-            )?;
+            let define_columns = stmt_with_define.columns();
+            let mut define_acc: Vec<u8> = first_define_pkt[PACKET_HEADER_SIZE..].to_vec();
+            result = loop {
+                match self.parse_query_response_eor(&define_acc, &caps, define_columns) {
+                    Ok((r, true)) => break r,
+                    Ok((_, false)) | Err(Error::BufferUnderflow { .. }) => {
+                        let next = inner.receive().await?;
+                        if next.len() < PACKET_HEADER_SIZE + 2 {
+                            return Err(Error::Protocol(
+                                "Truncated continuation packet in define response".to_string(),
+                            ));
+                        }
+                        if next[4] == PacketType::Marker as u8 {
+                            let error_response = inner.handle_marker_reset().await?;
+                            let payload = &error_response[PACKET_HEADER_SIZE..];
+                            return self.parse_error_response(payload);
+                        }
+                        define_acc.extend_from_slice(&next[PACKET_HEADER_SIZE + 2..]);
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
         }
 
         Ok(result)
