@@ -3394,15 +3394,18 @@ impl Connection {
         Ok(Row::new(values))
     }
 
-    /// Consume the two UB2 fields Oracle appends after a LONG/LONG RAW
-    /// column's chunked value (observed empirically: both 0 for a value that
-    /// arrived complete in one piece). Without this, the read position drifts
-    /// by these bytes and all subsequent parsing in the response desyncs —
-    /// the row itself decodes correctly, but the following message is
-    /// misread, `parse_query_response_eor` never finds the terminator, and
-    /// the caller either mis-parses a later message as an error or (with a
-    /// multi-packet accumulation loop) blocks forever waiting for a
-    /// continuation packet the server already fully sent. KDB-118.
+    /// Consume the two UB2 fields Oracle appends after every LONG/LONG RAW
+    /// column slot (observed empirically: both 0 for a value that arrived
+    /// complete in one piece). This trailer belongs to the column slot
+    /// itself, not to whether the value has data — it is present for NULL
+    /// and empty values too, so callers must invoke this regardless of
+    /// which `data` match arm they're in. Without it, the read position
+    /// drifts by these bytes and all subsequent parsing in the response
+    /// desyncs: the row up to and including the LONG value decodes
+    /// correctly, but the following message is misread, so a later typed
+    /// column may fail with a spurious byte-length error, or (with a
+    /// multi-packet accumulation loop) the caller blocks forever waiting
+    /// for a continuation packet the server already fully sent. KDB-118.
     fn skip_long_column_trailer(&self, buf: &mut ReadBuffer) -> Result<()> {
         buf.read_ub2()?;
         buf.read_ub2()?;
@@ -3432,9 +3435,24 @@ impl Connection {
         // First, check if it's NULL
         let data = buf.read_bytes_with_length()?;
 
+        // A LONG/LONG RAW column carries its trailer even when the value
+        // itself is NULL or empty — the trailer belongs to the column slot,
+        // not to the presence of data. KDB-118.
+        let is_long_column = matches!(col.oracle_type, OracleType::Long | OracleType::LongRaw);
+
         match data {
-            None => Ok(Value::Null),
-            Some(bytes) if bytes.is_empty() => Ok(Value::Null),
+            None => {
+                if is_long_column {
+                    self.skip_long_column_trailer(buf)?;
+                }
+                Ok(Value::Null)
+            }
+            Some(bytes) if bytes.is_empty() => {
+                if is_long_column {
+                    self.skip_long_column_trailer(buf)?;
+                }
+                Ok(Value::Null)
+            }
             Some(bytes) => {
                 // Decode based on oracle type
                 match col.oracle_type {
@@ -3445,7 +3463,7 @@ impl Connection {
                     }
                     OracleType::Varchar | OracleType::Char | OracleType::Long => {
                         let s = String::from_utf8_lossy(&bytes).to_string();
-                        if col.oracle_type == OracleType::Long {
+                        if is_long_column {
                             self.skip_long_column_trailer(buf)?;
                         }
                         Ok(Value::String(s))
@@ -3453,7 +3471,7 @@ impl Connection {
                     OracleType::Raw | OracleType::LongRaw => {
                         // RAW/LONG RAW types - return as bytes
                         let v = bytes.to_vec();
-                        if col.oracle_type == OracleType::LongRaw {
+                        if is_long_column {
                             self.skip_long_column_trailer(buf)?;
                         }
                         Ok(Value::Bytes(v))
