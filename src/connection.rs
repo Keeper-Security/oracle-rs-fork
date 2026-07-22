@@ -268,6 +268,46 @@ impl OracleStream {
         }
     }
 
+    /// Half-close the write side (sends TCP FIN) then drain all pending inbound
+    /// data until EOF or a short timeout.
+    ///
+    /// This prevents TCP RST when the socket is subsequently dropped while Oracle
+    /// is still streaming data into the receive buffer.  RST propagates through any
+    /// TCP proxy (e.g. Keeper Commander tunnel) as a fatal signal and tears down the
+    /// whole session; a graceful FIN does not.  Errors are silently ignored — this
+    /// is best-effort cleanup.
+    async fn drain_and_shutdown(&mut self) {
+        // Half-close write side: signals to Oracle that we are done sending.
+        let _ = match self {
+            OracleStream::Plain(s) => AsyncWriteExt::shutdown(s).await,
+            OracleStream::Tls(s) => AsyncWriteExt::shutdown(s).await,
+        };
+        // Drain remaining inbound data so the receive buffer is empty when the
+        // socket drops.  Bounded by a 30 s timeout: a cancelled query can keep
+        // Oracle computing for many seconds before it sends the final result +
+        // FIN; 30 s covers realistic slow queries without blocking forever.
+        let mut buf = [0u8; 4096];
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(30000);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let n = match self {
+                OracleStream::Plain(s) => {
+                    tokio::time::timeout(remaining, AsyncReadExt::read(s, &mut buf)).await
+                }
+                OracleStream::Tls(s) => {
+                    tokio::time::timeout(remaining, AsyncReadExt::read(s, &mut buf)).await
+                }
+            };
+            match n {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(_)) => {}
+            }
+        }
+    }
 }
 
 /// Internal connection state shared across async operations
@@ -2032,6 +2072,14 @@ impl Connection {
                     // Status message - usually marks end
                     break;
                 }
+                // Server-side piggyback (23) - skip in full (see parse_dml_response)
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
+                }
+                // Warning (15)
+                x if x == MessageType::Warning as u8 => {
+                    self.skip_warning(&mut buf)?;
+                }
                 x if x == MessageType::EndOfResponse as u8 => {
                     break;
                 }
@@ -2420,7 +2468,14 @@ impl Connection {
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
         inner.send(&request).await?;
 
-        // Receive and parse response
+        // Receive and parse response. A query response can span multiple TNS
+        // DATA packets, and a row/value may straddle a packet boundary, so we
+        // accumulate packets into one contiguous payload and parse until the
+        // parser reaches the end-of-response message. We key on that MESSAGE
+        // (not the END_OF_RESPONSE packet flag), because an intermediate prefetch
+        // batch doesn't set the flag — keying on the flag would block waiting for
+        // a packet the server won't send until a fetch_more. A single-packet
+        // response is parsed on the first iteration (common case).
         let response = inner.receive().await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty query response".to_string()));
@@ -2435,14 +2490,42 @@ impl Connection {
             return self.parse_error_response(payload);
         }
 
-        // Parse the response to extract columns and rows
-        let payload = &response[PACKET_HEADER_SIZE..];
-        let mut result = self.parse_query_response(payload, &inner.capabilities)?;
+        // First packet keeps its 2-byte data flags; continuation packets drop
+        // theirs so the message stream stays contiguous for the parser.
+        let caps = inner.capabilities.clone();
+        let mut acc: Vec<u8> = response[PACKET_HEADER_SIZE..].to_vec();
+        let mut result = loop {
+            match self.parse_query_response_eor(&acc, &caps, &[]) {
+                Ok((r, true)) => break r,
+                // Not complete yet (payload exhausted before the terminator) or a
+                // value straddled the packet boundary — pull the next packet.
+                Ok((_, false)) | Err(Error::BufferUnderflow { .. }) => {
+                    let next = inner.receive().await?;
+                    if next.len() < PACKET_HEADER_SIZE + 2 {
+                        return Err(Error::Protocol(
+                            "Truncated continuation packet in query response".to_string(),
+                        ));
+                    }
+                    if next[4] == PacketType::Marker as u8 {
+                        let error_response = inner.handle_marker_reset().await?;
+                        let payload = &error_response[PACKET_HEADER_SIZE..];
+                        return self.parse_error_response(payload);
+                    }
+                    acc.extend_from_slice(&next[PACKET_HEADER_SIZE + 2..]);
+                }
+                Err(e) => return Err(e),
+            }
+        };
 
-        // Check if any columns are LOB types that require defines
-        let has_lob_columns = result.columns.iter().any(|col| col.is_lob());
+        // Check if any columns require an explicit define (LOBs, and LONG /
+        // LONG RAW — the latter only stream their chunked data when the DEFINE
+        // advertises MAX_LONG_LENGTH; see execute::write_column_defines. KDB-87).
+        let needs_define = result
+            .columns
+            .iter()
+            .any(|col| col.oracle_type.requires_define());
 
-        if has_lob_columns && !statement.requires_define() {
+        if needs_define && !statement.requires_define() {
             // We need to re-execute with column defines
             // Create a modified statement with the define flag set
             let mut stmt_with_define = statement.clone();
@@ -2461,27 +2544,43 @@ impl Connection {
             let define_request = define_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
             inner.send(&define_request).await?;
 
-            // Receive the re-execute response
-            let define_response = inner.receive().await?;
-            if define_response.len() <= PACKET_HEADER_SIZE {
+            // Receive and accumulate the re-execute response. The primary
+            // KDB-118 fix is the trailer consumption in `parse_column_value`
+            // (see `skip_long_column_trailer`); this loop additionally
+            // guards against a LONG value large enough to genuinely span
+            // multiple TTC DATA packets (SDU limit ~8 KB), mirroring the
+            // first-execute accumulation loop above.
+            let first_define_pkt = inner.receive().await?;
+            if first_define_pkt.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty define response".to_string()));
             }
-
-            // Check for MARKER packet
-            let packet_type = define_response[4];
-            if packet_type == PacketType::Marker as u8 {
+            if first_define_pkt[4] == PacketType::Marker as u8 {
                 let error_response = inner.handle_marker_reset().await?;
                 let payload = &error_response[PACKET_HEADER_SIZE..];
                 return self.parse_error_response(payload);
             }
-
-            // Parse the response with LOB data, using the columns we already know
-            let payload = &define_response[PACKET_HEADER_SIZE..];
-            result = self.parse_query_response_with_columns(
-                payload,
-                &inner.capabilities,
-                &stmt_with_define.columns(),
-            )?;
+            let define_columns = stmt_with_define.columns();
+            let mut define_acc: Vec<u8> = first_define_pkt[PACKET_HEADER_SIZE..].to_vec();
+            result = loop {
+                match self.parse_query_response_eor(&define_acc, &caps, define_columns) {
+                    Ok((r, true)) => break r,
+                    Ok((_, false)) | Err(Error::BufferUnderflow { .. }) => {
+                        let next = inner.receive().await?;
+                        if next.len() < PACKET_HEADER_SIZE + 2 {
+                            return Err(Error::Protocol(
+                                "Truncated continuation packet in define response".to_string(),
+                            ));
+                        }
+                        if next[4] == PacketType::Marker as u8 {
+                            let error_response = inner.handle_marker_reset().await?;
+                            let payload = &error_response[PACKET_HEADER_SIZE..];
+                            return self.parse_error_response(payload);
+                        }
+                        define_acc.extend_from_slice(&next[PACKET_HEADER_SIZE + 2..]);
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
         }
 
         Ok(result)
@@ -2604,15 +2703,17 @@ impl Connection {
                                 }
                             }
                             Err(_e) => {
-                                // EOF after reset is normal - server may close connection
-                                // without sending error details. Return a descriptive error.
+                                // EOF after reset: Oracle closed the TCP connection after the
+                                // BREAK/RESET handshake without sending error details. This
+                                // leaves the connection permanently broken — return a connection
+                                // error so callers can detect it via is_connection_error() and
+                                // avoid reusing this connection for subsequent statements.
                                 inner.state = ConnectionState::Closed;
-                                return Err(Error::OracleError {
-                                    code: 0,
-                                    message: "Server rejected the operation and closed the connection. \
-                                              This may happen when binding a temporary LOB to an INSERT statement. \
-                                              Try using a different approach (e.g., DBMS_LOB procedures).".to_string(),
-                                });
+                                return Err(Error::ConnectionClosedByServer(
+                                    "server closed connection after break/reset handshake \
+                                     (DDL errors and some DML errors cause this on Oracle XE)"
+                                        .to_string(),
+                                ));
                             }
                         }
                     }
@@ -2636,13 +2737,30 @@ impl Connection {
         self.parse_query_response_with_columns(payload, caps, &[])
     }
 
-    /// Parse query response with pre-known columns (for re-execute after define)
+    /// Thin wrapper that drops the end-of-response flag for callers that don't
+    /// stream packets (the response already fits one packet).
     fn parse_query_response_with_columns(
         &self,
         payload: &[u8],
         caps: &Capabilities,
         known_columns: &[ColumnInfo],
     ) -> Result<QueryResult> {
+        Ok(self
+            .parse_query_response_eor(payload, caps, known_columns)?
+            .0)
+    }
+
+    /// Parse a query response, also reporting whether the end-of-response
+    /// terminator message was reached (`true`) or the payload ran out first
+    /// (`false`, meaning more TNS packets are needed — see the streaming loop in
+    /// `execute_query_with_params`). A response can span multiple TNS DATA
+    /// packets; a single packet is NOT guaranteed to contain the whole response.
+    fn parse_query_response_eor(
+        &self,
+        payload: &[u8],
+        caps: &Capabilities,
+        known_columns: &[ColumnInfo],
+    ) -> Result<(QueryResult, bool)> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Query response too short".to_string()));
         }
@@ -2740,6 +2858,16 @@ impl Connection {
                     }
                 }
 
+                // Server-side piggyback (23) - skip in full (see parse_dml_response)
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
+                }
+
+                // Warning (15)
+                x if x == MessageType::Warning as u8 => {
+                    self.skip_warning(&mut buf)?;
+                }
+
                 _ => {
                     // Unknown message type - break to avoid parsing errors
                     break;
@@ -2747,13 +2875,16 @@ impl Connection {
             }
         }
 
-        Ok(QueryResult {
-            columns,
-            rows,
-            rows_affected: row_count,
-            has_more_rows: false,
-            cursor_id,
-        })
+        Ok((
+            QueryResult {
+                columns,
+                rows,
+                rows_affected: row_count,
+                has_more_rows: false,
+                cursor_id,
+            },
+            end_of_response,
+        ))
     }
 
     /// Parse a PL/SQL response containing OUT parameter values
@@ -2872,6 +3003,16 @@ impl Connection {
                 x if x == MessageType::ImplicitResultset as u8 => {
                     let parsed_results = self.parse_implicit_results(&mut buf, caps)?;
                     implicit_results = parsed_results;
+                }
+
+                // Server-side piggyback (23) - skip in full (see parse_dml_response)
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
+                }
+
+                // Warning (15)
+                x if x == MessageType::Warning as u8 => {
+                    self.skip_warning(&mut buf)?;
                 }
 
                 _ => {
@@ -3068,6 +3209,121 @@ impl Connection {
         }
     }
 
+    /// Consume a SERVER_SIDE_PIGGYBACK (message type 23) body.
+    ///
+    /// Oracle prepends these control messages to a call's response to push
+    /// session-state changes back to the client — e.g. `ALTER SESSION SET
+    /// CURRENT_SCHEMA` makes the server emit a SYNC piggyback carrying the new
+    /// schema. We don't need the contents, but we MUST consume exactly the right
+    /// number of bytes so the message that follows (the call's Error /
+    /// EndOfResponse terminator) is parsed at the correct offset. Skipping this
+    /// is what previously corrupted the stream: `parse_dml_response` fell through
+    /// to its catch-all arm, byte-walked into the piggyback body, and eventually
+    /// misread a data byte as an Error message → "buffer underflow".
+    ///
+    /// The message-type byte (23) has already been read by the caller; this reads
+    /// from the opcode byte onward. Ported 1:1 from python-oracledb
+    /// `_process_server_side_piggyback` (opcode names in comments).
+    fn skip_server_side_piggyback(&self, buf: &mut ReadBuffer) -> Result<()> {
+        let opcode = buf.read_u8()?;
+        match opcode {
+            // LTXID: single length-prefixed byte string
+            7 => {
+                let _ = buf.read_bytes_with_length()?;
+            }
+            // QUERY_CACHE_INVALIDATION (1) | TRACE_EVENT (3): no body
+            1 | 3 => {}
+            // OS_PID_MTS (2)
+            2 => {
+                let _ = buf.read_ub2()?;
+                buf.skip_raw_bytes_chunked()?; // skip_bytes()
+            }
+            // SYNC (5): key/value pairs of session settings (current schema, …)
+            5 => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+                let num_elements = buf.read_ub2()?;
+                buf.skip_ub1()?; // length
+                for _ in 0..num_elements {
+                    if buf.read_ub2()? > 0 {
+                        let _ = buf.read_bytes_with_length()?; // text value
+                    }
+                    if buf.read_ub2()? > 0 {
+                        let _ = buf.read_bytes_with_length()?; // binary value
+                    }
+                    buf.skip_ub2()?; // keyword num
+                }
+                buf.skip_ub4()?; // overall flags
+            }
+            // EXT_SYNC (9)
+            9 => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+            }
+            // AC_REPLAY_CONTEXT (8)
+            8 => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+                buf.skip_ub4()?; // flags
+                buf.skip_ub4()?; // error code
+                buf.skip_ub1()?; // queue
+                // skip_bytes_with_length(): ub4 length, then chunked bytes
+                if buf.read_ub4()? > 0 {
+                    buf.skip_raw_bytes_chunked()?;
+                }
+            }
+            // SESS_RET (4): session return parameters
+            4 => {
+                buf.skip_ub2()?;
+                buf.skip_ub1()?;
+                let num_elements = buf.read_ub2()?;
+                if num_elements > 0 {
+                    buf.skip_ub1()?;
+                    for _ in 0..num_elements {
+                        if buf.read_ub2()? > 0 {
+                            buf.skip_raw_bytes_chunked()?; // key
+                        }
+                        if buf.read_ub2()? > 0 {
+                            buf.skip_raw_bytes_chunked()?; // value
+                        }
+                        buf.skip_ub2()?; // flags
+                    }
+                }
+                buf.skip_ub4()?; // session flags
+                buf.skip_ub4()?; // session id
+                buf.skip_ub2()?; // serial number
+            }
+            // SESS_SIGNATURE (10)
+            10 => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+                buf.skip_ub8()?; // signature flags
+                buf.skip_ub8()?; // client signature
+                buf.skip_ub8()?; // server signature
+            }
+            other => {
+                return Err(Error::Protocol(format!(
+                    "unknown server-side piggyback opcode {other}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a WARNING (message type 15) body. These accompany e.g. DDL that
+    /// "compiled with warnings"; like piggybacks they must be skipped exactly so
+    /// the following terminator parses correctly. Ported from python-oracledb
+    /// `_process_warning_info`.
+    fn skip_warning(&self, buf: &mut ReadBuffer) -> Result<()> {
+        let error_num = buf.read_ub2()?; // error/warning number
+        let msg_present = buf.read_ub2()?; // length of message (indicator)
+        buf.skip_ub2()?; // flags
+        if error_num != 0 && msg_present > 0 {
+            let _ = buf.read_bytes_with_length()?; // message text
+        }
+        Ok(())
+    }
+
     /// Parse a single row of data
     fn parse_row_data_single(
         &self,
@@ -3138,6 +3394,24 @@ impl Connection {
         Ok(Row::new(values))
     }
 
+    /// Consume the two UB2 fields Oracle appends after every LONG/LONG RAW
+    /// column slot (observed empirically: both 0 for a value that arrived
+    /// complete in one piece). This trailer belongs to the column slot
+    /// itself, not to whether the value has data — it is present for NULL
+    /// and empty values too, so callers must invoke this regardless of
+    /// which `data` match arm they're in. Without it, the read position
+    /// drifts by these bytes and all subsequent parsing in the response
+    /// desyncs: the row up to and including the LONG value decodes
+    /// correctly, but the following message is misread, so a later typed
+    /// column may fail with a spurious byte-length error, or (with a
+    /// multi-packet accumulation loop) the caller blocks forever waiting
+    /// for a continuation packet the server already fully sent. KDB-118.
+    fn skip_long_column_trailer(&self, buf: &mut ReadBuffer) -> Result<()> {
+        buf.read_ub2()?;
+        buf.read_ub2()?;
+        Ok(())
+    }
+
     /// Parse a single column value from the buffer
     fn parse_column_value(&self, buf: &mut ReadBuffer, col: &ColumnInfo, caps: &Capabilities) -> Result<Value> {
         use crate::constants::OracleType;
@@ -3161,9 +3435,24 @@ impl Connection {
         // First, check if it's NULL
         let data = buf.read_bytes_with_length()?;
 
+        // A LONG/LONG RAW column carries its trailer even when the value
+        // itself is NULL or empty — the trailer belongs to the column slot,
+        // not to the presence of data. KDB-118.
+        let is_long_column = matches!(col.oracle_type, OracleType::Long | OracleType::LongRaw);
+
         match data {
-            None => Ok(Value::Null),
-            Some(bytes) if bytes.is_empty() => Ok(Value::Null),
+            None => {
+                if is_long_column {
+                    self.skip_long_column_trailer(buf)?;
+                }
+                Ok(Value::Null)
+            }
+            Some(bytes) if bytes.is_empty() => {
+                if is_long_column {
+                    self.skip_long_column_trailer(buf)?;
+                }
+                Ok(Value::Null)
+            }
             Some(bytes) => {
                 // Decode based on oracle type
                 match col.oracle_type {
@@ -3174,11 +3463,18 @@ impl Connection {
                     }
                     OracleType::Varchar | OracleType::Char | OracleType::Long => {
                         let s = String::from_utf8_lossy(&bytes).to_string();
+                        if is_long_column {
+                            self.skip_long_column_trailer(buf)?;
+                        }
                         Ok(Value::String(s))
                     }
                     OracleType::Raw | OracleType::LongRaw => {
                         // RAW/LONG RAW types - return as bytes
-                        Ok(Value::Bytes(bytes.to_vec()))
+                        let v = bytes.to_vec();
+                        if is_long_column {
+                            self.skip_long_column_trailer(buf)?;
+                        }
+                        Ok(Value::Bytes(v))
                     }
                     OracleType::Date => {
                         // Oracle DATE format - 7 bytes
@@ -3689,6 +3985,18 @@ impl Connection {
                     if buf.remaining() > 0 {
                         let _byte = buf.read_u8()?;
                     }
+                }
+
+                // Server-side piggyback (23) - session-state push (e.g. the SYNC
+                // piggyback from ALTER SESSION SET CURRENT_SCHEMA). Must be
+                // consumed in full so the trailing Error/EndOfResponse parses.
+                23 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
+                }
+
+                // Warning (15)
+                15 => {
+                    self.skip_warning(&mut buf)?;
                 }
 
                 // End of Response (29) - explicit end marker
@@ -5019,9 +5327,12 @@ impl Connection {
 
         inner.state = ConnectionState::Closed;
 
-        // Close the TCP stream
-        if let Some(stream) = inner.stream.take() {
-            drop(stream);
+        // Gracefully close the TCP stream: drain pending receive data before
+        // dropping so the OS sends FIN rather than RST.  RST from a close with
+        // unread receive-buffer data propagates through any TCP proxy (e.g. Keeper
+        // Commander tunnel) as a fatal signal and tears down the whole session.
+        if let Some(mut stream) = inner.stream.take() {
+            stream.drain_and_shutdown().await;
         }
 
         Ok(())

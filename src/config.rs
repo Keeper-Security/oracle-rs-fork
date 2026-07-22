@@ -11,6 +11,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+use secrecy::{ExposeSecret, Secret};
+
 use crate::constants::charset;
 use crate::error::{Error, Result};
 use crate::transport::TlsConfig;
@@ -116,8 +118,8 @@ pub struct Config {
     pub service: ServiceMethod,
     /// Username for authentication
     pub username: String,
-    /// Password for authentication (stored temporarily)
-    password: String,
+    /// Password for authentication — zeroized on drop via `Secret<String>`
+    password: Secret<String>,
     /// TLS mode
     pub tls_mode: TlsMode,
     /// TLS configuration (certificates, wallet, etc.)
@@ -153,7 +155,7 @@ impl Config {
             port,
             service: ServiceMethod::ServiceName(service_name.into()),
             username: username.into(),
-            password: password.into(),
+            password: Secret::new(password.into()),
             tls_mode: TlsMode::Disable,
             tls_config: None,
             connect_timeout: Duration::from_secs(10),
@@ -178,7 +180,7 @@ impl Config {
             port,
             service: ServiceMethod::Sid(sid.into()),
             username: username.into(),
-            password: password.into(),
+            password: Secret::new(password.into()),
             tls_mode: TlsMode::Disable,
             tls_config: None,
             connect_timeout: Duration::from_secs(10),
@@ -331,14 +333,16 @@ impl Config {
         self
     }
 
-    /// Get the password (for authentication)
+    /// Get the password bytes for authentication. The expose_secret call is
+    /// intentionally contained here; callers use the returned `&str` only for
+    /// the duration of the auth handshake.
     pub(crate) fn password(&self) -> &str {
-        &self.password
+        self.password.expose_secret()
     }
 
     /// Set the password
     pub fn set_password(&mut self, password: impl Into<String>) {
-        self.password = password.into();
+        self.password = Secret::new(password.into());
     }
 
     /// Set the username
@@ -425,7 +429,7 @@ impl Default for Config {
             port: DEFAULT_PORT,
             service: ServiceMethod::ServiceName("FREEPDB1".to_string()),
             username: String::new(),
-            password: String::new(),
+            password: Secret::new(String::new()),
             tls_mode: TlsMode::Disable,
             tls_config: None,
             connect_timeout: Duration::from_secs(10),
