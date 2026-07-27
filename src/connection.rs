@@ -54,10 +54,17 @@ use crate::statement_cache::StatementCache;
 /// The accumulation loops below read continuation packets until the parser
 /// reaches an end-of-response marker. That termination condition depends on the
 /// peer behaving; a misbehaving or hostile server could stream continuation
-/// packets forever, growing the accumulation buffer without bound. This cap
-/// turns that into a protocol error instead of an unbounded loop. It is set far
-/// above any legitimate response (a full 8 KB SDU x 4096 packets is ~32 MB of
-/// TTC payload for one round trip).
+/// packets forever. This cap makes those loops terminate unconditionally,
+/// raising `Error::Protocol` instead of spinning. 4096 packets is far above any
+/// legitimate response.
+///
+/// This bounds the *packet count*, not the memory the accumulation buffer can
+/// reach. The byte ceiling is SDU-dependent and is not a guarantee: `sdu_size`
+/// is negotiated with the peer (see the `accept.sdu` assignment in
+/// `send_connect_packet`), so while the 8 KB default works out to ~32 MB, a
+/// negotiated maximum SDU puts the worst case near 256 MB. Do not cite a byte
+/// figure here as a memory bound — if one is needed, cap the accumulated
+/// buffer length directly, which stays correct at any SDU.
 const MAX_ACCUMULATION_PACKETS: usize = 4096;
 
 /// Connection state
