@@ -49,6 +49,24 @@ use crate::statement::{BindParam, ColumnInfo, Statement, StatementType};
 use crate::types::{LobData, LobLocator, LobValue};
 use crate::statement_cache::StatementCache;
 
+/// Upper bound on how many TNS DATA packets a single logical response may span.
+///
+/// The accumulation loops below read continuation packets until the parser
+/// reaches an end-of-response marker. That termination condition depends on the
+/// peer behaving; a misbehaving or hostile server could stream continuation
+/// packets forever. This cap makes those loops terminate unconditionally,
+/// raising `Error::Protocol` instead of spinning. 4096 packets is far above any
+/// legitimate response.
+///
+/// This bounds the *packet count*, not the memory the accumulation buffer can
+/// reach. The byte ceiling is SDU-dependent and is not a guarantee: `sdu_size`
+/// is negotiated with the peer (see the `accept.sdu` assignment in
+/// `send_connect_packet`), so while the 8 KB default works out to ~32 MB, a
+/// negotiated maximum SDU puts the worst case near 256 MB. Do not cite a byte
+/// figure here as a memory bound — if one is needed, cap the accumulated
+/// buffer length directly, which stays correct at any SDU.
+const MAX_ACCUMULATION_PACKETS: usize = 4096;
+
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -470,8 +488,17 @@ impl ConnectionInner {
 
         let mut accumulated_payload = Vec::new();
         let mut is_first_packet = true;
+        let mut packet_count = 0usize;
 
         loop {
+            packet_count += 1;
+            if packet_count > MAX_ACCUMULATION_PACKETS {
+                return Err(Error::Protocol(format!(
+                    "multi-packet response exceeded {MAX_ACCUMULATION_PACKETS} packets; \
+                     peer may be misbehaving"
+                )));
+            }
+
             let packet = self.receive().await?;
 
             if packet.len() < PACKET_HEADER_SIZE {
@@ -2494,12 +2521,20 @@ impl Connection {
         // theirs so the message stream stays contiguous for the parser.
         let caps = inner.capabilities.clone();
         let mut acc: Vec<u8> = response[PACKET_HEADER_SIZE..].to_vec();
+        let mut packet_count = 1usize; // the first packet, already received
         let mut result = loop {
             match self.parse_query_response_eor(&acc, &caps, &[]) {
                 Ok((r, true)) => break r,
                 // Not complete yet (payload exhausted before the terminator) or a
                 // value straddled the packet boundary — pull the next packet.
                 Ok((_, false)) | Err(Error::BufferUnderflow { .. }) => {
+                    packet_count += 1;
+                    if packet_count > MAX_ACCUMULATION_PACKETS {
+                        return Err(Error::Protocol(format!(
+                            "query response exceeded {MAX_ACCUMULATION_PACKETS} packets; \
+                             peer may be misbehaving"
+                        )));
+                    }
                     let next = inner.receive().await?;
                     if next.len() < PACKET_HEADER_SIZE + 2 {
                         return Err(Error::Protocol(
@@ -2561,10 +2596,18 @@ impl Connection {
             }
             let define_columns = stmt_with_define.columns();
             let mut define_acc: Vec<u8> = first_define_pkt[PACKET_HEADER_SIZE..].to_vec();
+            let mut define_packet_count = 1usize; // the first packet, already received
             result = loop {
                 match self.parse_query_response_eor(&define_acc, &caps, define_columns) {
                     Ok((r, true)) => break r,
                     Ok((_, false)) | Err(Error::BufferUnderflow { .. }) => {
+                        define_packet_count += 1;
+                        if define_packet_count > MAX_ACCUMULATION_PACKETS {
+                            return Err(Error::Protocol(format!(
+                                "define response exceeded {MAX_ACCUMULATION_PACKETS} packets; \
+                                 peer may be misbehaving"
+                            )));
+                        }
                         let next = inner.receive().await?;
                         if next.len() < PACKET_HEADER_SIZE + 2 {
                             return Err(Error::Protocol(
@@ -3302,6 +3345,10 @@ impl Connection {
                 buf.skip_ub8()?; // server signature
             }
             other => {
+                // Hard error by design: we cannot skip an unknown opcode because its
+                // wire length is not self-describing. Silently ignoring it would
+                // misalign the read cursor, corrupting every subsequent message parse.
+                // If Oracle introduces a new opcode, it must be handled explicitly above.
                 return Err(Error::Protocol(format!(
                     "unknown server-side piggyback opcode {other}"
                 )));
@@ -3979,7 +4026,7 @@ impl Connection {
                 }
 
                 // BitVector (21)
-                21 => {
+                x if x == MessageType::BitVector as u8 => {
                     let _num_columns_sent = buf.read_ub2()?;
                     // No columns for DML, but read the byte if present
                     if buf.remaining() > 0 {
@@ -3990,17 +4037,17 @@ impl Connection {
                 // Server-side piggyback (23) - session-state push (e.g. the SYNC
                 // piggyback from ALTER SESSION SET CURRENT_SCHEMA). Must be
                 // consumed in full so the trailing Error/EndOfResponse parses.
-                23 => {
+                x if x == MessageType::ServerSidePiggyback as u8 => {
                     self.skip_server_side_piggyback(&mut buf)?;
                 }
 
                 // Warning (15)
-                15 => {
+                x if x == MessageType::Warning as u8 => {
                     self.skip_warning(&mut buf)?;
                 }
 
                 // End of Response (29) - explicit end marker
-                29 => {
+                x if x == MessageType::EndOfResponse as u8 => {
                     end_of_response = true;
                 }
 
