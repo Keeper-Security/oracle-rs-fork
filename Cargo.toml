@@ -61,9 +61,9 @@ serde_json = "1"
 # is safe to link in binaries that also pull rustls' ring provider.
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12", "logging"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
-rustls-pemfile = "2"
 webpki-roots = "0.26"
-rustls-pki-types = "1"
+# PEM parsing (certs + private keys) uses the PemObject trait, which requires 1.9+.
+rustls-pki-types = { version = "1.9", features = ["std"] }
 
 # Encrypted PEM/PKCS#8 key support (for Oracle wallet)
 pkcs8 = { version = "0.10", features = ["encryption", "pem"] }

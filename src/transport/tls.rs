@@ -8,7 +8,6 @@
 //! - SNI (Server Name Indication)
 
 use std::fs::{self, File};
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,9 +15,9 @@ use pkcs8::EncryptedPrivateKeyInfo;
 use pkcs8::SecretDocument;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
-use rustls_pemfile::{certs, private_key};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -442,9 +441,8 @@ pub async fn connect_tls(
 fn load_certs_from_file(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path)
         .map_err(|e| Error::Internal(format!("Failed to open cert file {}: {}", path, e)))?;
-    let mut reader = BufReader::new(file);
 
-    let certs: Vec<CertificateDer<'static>> = certs(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(file)
         .filter_map(|r| r.ok())
         .collect();
 
@@ -462,11 +460,11 @@ fn load_certs_from_file(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 fn load_private_key_from_file(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path)
         .map_err(|e| Error::Internal(format!("Failed to open key file {}: {}", path, e)))?;
-    let mut reader = BufReader::new(file);
 
-    private_key(&mut reader)
-        .map_err(|e| Error::Internal(format!("Failed to parse key file {}: {}", path, e)))?
-        .ok_or_else(|| Error::Internal(format!("No private key found in {}", path)))
+    PrivateKeyDer::from_pem_reader(file).map_err(|e| match e {
+        PemError::NoItemsFound => Error::Internal(format!("No private key found in {}", path)),
+        e => Error::Internal(format!("Failed to parse key file {}: {}", path, e)),
+    })
 }
 
 /// Load certificates from an Oracle wallet directory
@@ -552,13 +550,21 @@ fn load_private_key_from_wallet(
         let der_bytes = decrypted_doc.as_bytes().to_vec();
         Ok(Some(PrivateKeyDer::Pkcs8(der_bytes.into())))
     } else {
-        // Try unencrypted key using standard rustls_pemfile
+        // Try unencrypted key via rustls-pki-types' PemObject. NoItemsFound
+        // means "no key present" (not an error) — matches the prior
+        // rustls_pemfile::private_key() behavior of returning Ok(None) rather
+        // than erroring when the wallet PEM has no private-key section.
         let file = File::open(&pem_path)
             .map_err(|e| Error::Internal(format!("Failed to open wallet: {}", e)))?;
-        let mut reader = BufReader::new(file);
 
-        Ok(private_key(&mut reader)
-            .map_err(|e| Error::Internal(format!("Failed to parse wallet key: {}", e)))?)
+        match PrivateKeyDer::from_pem_reader(file) {
+            Ok(key) => Ok(Some(key)),
+            Err(PemError::NoItemsFound) => Ok(None),
+            Err(e) => Err(Error::Internal(format!(
+                "Failed to parse wallet key: {}",
+                e
+            ))),
+        }
     }
 }
 
@@ -732,5 +738,112 @@ mod tests {
     fn test_danger_accept_invalid_certs() {
         let config = TlsConfig::new().danger_accept_invalid_certs();
         assert!(!config.verify_server);
+    }
+
+    // Keeper fork (KDB-198): exercise the rustls-pki-types `PemObject`-based
+    // loaders directly. Throwaway self-signed EC cert/key generated once via
+    // `openssl req -x509` / `openssl pkcs8` — not a secret, only used to
+    // verify PEM decoding.
+
+    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBizCCATGgAwIBAgIUFhPu0R2hsJI69mXymgKPn3YznUQwCgYIKoZIzj0EAwIw\n\
+GzEZMBcGA1UEAwwQdGVzdC5leGFtcGxlLmNvbTAeFw0yNjA5MDQxNzQwMjBaFw0y\n\
+NjA5MDUxNzQwMjBaMBsxGTAXBgNVBAMMEHRlc3QuZXhhbXBsZS5jb20wWTATBgcq\n\
+hkjOPQIBBggqhkjOPQMBBwNCAARLKSbjSKggOTMpU4dWINPB63M4FXTbNg0CrgFy\n\
+umNDsa13JW8+f2QvGa1UZBW7u0a4cYq0hNxn7ovh7wiodwj1o1MwUTAdBgNVHQ4E\n\
+FgQUXCxSHCzhDcg3leSPIASWoeHf6xowHwYDVR0jBBgwFoAUXCxSHCzhDcg3leSP\n\
+IASWoeHf6xowDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiAVy3lh\n\
+uTBGGutlEhM/uv4q/6M20Nx/Ata8QvJB8hkapQIhAIGrKhPMOy5BelEU+QXCpE/G\n\
+8KUOZabER6tn5hxtEPFm\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_KEY_PKCS8_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgMiqJfwgiEDA3IzWd\n\
+KgSARSUDBcJc4ReuK9FdZUaDiMuhRANCAARLKSbjSKggOTMpU4dWINPB63M4FXTb\n\
+Ng0CrgFyumNDsa13JW8+f2QvGa1UZBW7u0a4cYq0hNxn7ovh7wiodwj1\n\
+-----END PRIVATE KEY-----\n";
+
+    /// Write `contents` to a uniquely-named file under the OS temp dir and
+    /// return its path. Uniqueness is per-thread, which is sufficient because
+    /// `cargo test` runs each test on its own thread by default.
+    fn write_temp_pem(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "oracle_rs_kdb198_{}_{:?}.pem",
+            name,
+            std::thread::current().id()
+        ));
+        fs::write(&path, contents).expect("write temp PEM file");
+        path
+    }
+
+    #[test]
+    fn test_load_certs_from_file_parses_pem() {
+        let path = write_temp_pem("cert", TEST_CERT_PEM);
+        let certs = load_certs_from_file(path.to_str().unwrap()).expect("certs should parse");
+        assert_eq!(certs.len(), 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_certs_from_file_errors_when_empty() {
+        let path = write_temp_pem("cert_empty", "");
+        let err = load_certs_from_file(path.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, Error::Internal(msg) if msg.contains("No certificates found")));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_private_key_from_file_parses_pkcs8() {
+        let path = write_temp_pem("key", TEST_KEY_PKCS8_PEM);
+        let key = load_private_key_from_file(path.to_str().unwrap()).expect("key should parse");
+        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_private_key_from_file_errors_when_missing() {
+        // A file with a cert but no private-key section: NoItemsFound should
+        // map to the same "No private key found" error the old
+        // rustls_pemfile-based code returned via `Ok(None).ok_or_else(...)`.
+        let path = write_temp_pem("key_missing", TEST_CERT_PEM);
+        let err = load_private_key_from_file(path.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, Error::Internal(msg) if msg.contains("No private key found")));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_private_key_from_wallet_unencrypted() {
+        let dir = std::env::temp_dir().join(format!(
+            "oracle_rs_kdb198_wallet_ok_{:?}",
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("create wallet dir");
+        fs::write(dir.join("ewallet.pem"), TEST_KEY_PKCS8_PEM).expect("write ewallet.pem");
+
+        let key = load_private_key_from_wallet(dir.to_str().unwrap(), None)
+            .expect("wallet key should parse")
+            .expect("wallet key should be present");
+        assert!(matches!(key, PrivateKeyDer::Pkcs8(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_private_key_from_wallet_no_key_present() {
+        // No PRIVATE KEY section and no ENCRYPTED PRIVATE KEY marker: the
+        // unencrypted branch's NoItemsFound must map to `Ok(None)`, matching
+        // the old rustls_pemfile::private_key() `Ok(None)` behavior (absence
+        // of a key is not an error — see build_client_config's wallet path,
+        // which falls back to `with_no_client_auth()`).
+        let dir = std::env::temp_dir().join(format!(
+            "oracle_rs_kdb198_wallet_none_{:?}",
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("create wallet dir");
+        fs::write(dir.join("ewallet.pem"), TEST_CERT_PEM).expect("write ewallet.pem");
+
+        let key = load_private_key_from_wallet(dir.to_str().unwrap(), None)
+            .expect("absence of a key must not be an error");
+        assert!(key.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
